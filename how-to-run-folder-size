@@ -1,0 +1,4 @@
+.\MonthlyFolderSizeTracker.ps1 `
+  -Folders 'D:\Projects','E:\Video','C:\Data\Archive' `
+  -OutputDir "$env:USERPROFILE\Documents\FolderStats" `
+  -Tag 'key_folders'
