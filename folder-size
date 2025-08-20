@@ -1,0 +1,140 @@
+<# 
+.SYNOPSIS
+  Track selected folder sizes monthly and export to CSV for Excel.
+
+.PARAMETER Folders
+  Array of folder paths to analyze (only these folders are scanned).
+
+.PARAMETER OutputDir
+  Root directory where results are stored. Script creates YYYY-MM subfolder automatically.
+
+.PARAMETER Tag
+  Optional label added to filenames, e.g., "workstations" or "projects".
+
+.EXAMPLE
+  .\MonthlyFolderSizeTracker.ps1 `
+    -Folders 'D:\Projects','E:\Video','C:\Data\Archive' `
+    -OutputDir "$env:USERPROFILE\Documents\FolderStats" `
+    -Tag 'key_folders'
+#>
+
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)]
+  [string[]]$Folders,
+
+  [Parameter(Mandatory=$true)]
+  [string]$OutputDir,
+
+  [string]$Tag
+)
+
+function Get-FolderStats {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FolderPath
+    )
+
+    # Resolve and verify
+    $item = Get-Item -LiteralPath $FolderPath -ErrorAction SilentlyContinue
+    if (-not $item -or -not $item.PSIsContainer) {
+        throw "Folder not found or not a directory: $FolderPath"
+    }
+
+    # Enumerate all files under folder
+    $files = @()
+    try {
+        $files = Get-ChildItem -LiteralPath $FolderPath -File -Recurse -Force -ErrorAction SilentlyContinue
+    } catch { }
+
+    $sizeBytes = ($files | Measure-Object -Property Length -Sum).Sum
+    if (-not $sizeBytes) { $sizeBytes = 0 }
+
+    $fileCount = $files.Count
+
+    # Count subfolders
+    $subfolders = @()
+    try {
+        $subfolders = Get-ChildItem -LiteralPath $FolderPath -Directory -Recurse -Force -ErrorAction SilentlyContinue
+    } catch { }
+    $subfolderCount = $subfolders.Count
+
+    # Last write time (latest)
+    $lastWrite = $null
+    if ($files.Count -gt 0) {
+        $lastWrite = ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+    } else {
+        try {
+            $lastWrite = (Get-Item -LiteralPath $FolderPath -Force -ErrorAction SilentlyContinue).LastWriteTime
+        } catch { $lastWrite = $null }
+    }
+
+    [pscustomobject]@{
+        SnapshotDate   = Get-Date
+        FolderPath     = $FolderPath
+        FolderName     = Split-Path $FolderPath -Leaf
+        SizeBytes      = [int64]$sizeBytes
+        SizeMB         = if ($sizeBytes -gt 0) { [math]::Round($sizeBytes/1MB, 2) } else { 0 }
+        SizeGB         = if ($sizeBytes -gt 0) { [math]::Round($sizeBytes/1GB, 2) } else { 0 }
+        FileCount      = $fileCount
+        SubfolderCount = $subfolderCount
+        LastWriteTime  = $lastWrite
+    }
+}
+
+# --- Prep output paths (monthly folder + filenames) ---
+$monthTag = Get-Date -Format 'yyyy-MM'
+$dayTag   = Get-Date -Format 'yyyyMMdd'
+$tagPart  = if ([string]::IsNullOrWhiteSpace($Tag)) { '' } else { "_$Tag" }
+
+$monthFolder = Join-Path $OutputDir $monthTag
+if (-not (Test-Path -LiteralPath $monthFolder)) {
+    New-Item -Path $monthFolder -ItemType Directory -Force | Out-Null
+}
+
+# Dated snapshot (for this run) and rolling master log
+$dailyCsv   = Join-Path $monthFolder ("FolderSizes{0}_{1}.csv" -f $tagPart, $dayTag)
+$masterCsv  = Join-Path $OutputDir  ("FolderSizes{0}_MASTER.csv" -f $tagPart)
+
+Write-Host "Analyzing selected folders..."
+Write-Host "Month folder : $monthFolder"
+Write-Host "Daily CSV    : $dailyCsv"
+Write-Host "Master CSV   : $masterCsv"
+Write-Host ""
+
+# --- Scan selected folders ---
+$results = New-Object System.Collections.Generic.List[object]
+$total = $Folders.Count
+$idx = 0
+
+foreach ($folder in $Folders) {
+    $idx++
+    $pct = [int](($idx / $total) * 100)
+    Write-Progress -Activity "Scanning selected folders" -Status "$idx of $total" -PercentComplete $pct -CurrentOperation $folder
+
+    try {
+        $stats = Get-FolderStats -FolderPath $folder
+        $results.Add($stats) | Out-Null
+    } catch {
+        Write-Warning "Skipped $folder: $_"
+    }
+}
+
+# Sort by largest first (nice for Excel)
+$results = $results | Sort-Object SizeBytes -Descending
+
+# --- Write daily CSV (snapshot) ---
+$results | Export-Csv -Path $dailyCsv -NoTypeInformation -Encoding UTF8
+
+# --- Append/update master CSV ---
+# If master doesn't exist, create it; otherwise append
+if (-not (Test-Path -LiteralPath $masterCsv)) {
+    $results | Export-Csv -Path $masterCsv -NoTypeInformation -Encoding UTF8
+} else {
+    $results | Export-Csv -Path $masterCsv -NoTypeInformation -Append -Encoding UTF8
+}
+
+Write-Host ""
+Write-Host "Done."
+Write-Host "Snapshot saved to: $dailyCsv"
+Write-Host "Master log updated: $masterCsv"
