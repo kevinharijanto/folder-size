@@ -1,40 +1,120 @@
 <# 
-MonthlyFolderSizeTracker_Rollup.ps1
-Runs with no arguments. Press F5 in PowerShell ISE.
+Adds real-time status:
+- Write-Progress bars (overall + per phase)
+- progress.json heartbeat with % and ETA
+- ISE tab title showing % (if running in ISE)
 
-- Scans all depths
-- Adds Depth (0=root, 1=child, ...)
-- Computes both direct and rolled-up (recursive) sizes & file counts
-- Exports:
-   1) detailed per-folder snapshot (with totals)
-   2) per-depth summary snapshot (sum by depth)
-   3) updates MASTER (detailed)
+Press F5 in PowerShell ISE.
 #>
 
 # ===================== EDIT ME =====================
 [string[]]$Folders = @(
-  'C:\Users\Kevin\Documents'   # add more roots if you like
+  'C:\Users\Kevin\Documents'
 )
 
 [string]$OutputDir = 'C:\Users\Kevin\Documents\Space Check'
-
-[string]$Tag = 'monthly'
+[string]$Tag       = 'monthly'
 
 # Include folders that have no files at all?
 [bool]$IncludeEmptyFolders = $true
 # =================== /EDIT ME ======================
 
+# ---------------- UI/STATUS HELPERS ----------------
 function Ensure-Dir([string]$Path) {
-  if (!(Test-Path -LiteralPath $Path)) {
-    New-Item -Path $Path -ItemType Directory -Force | Out-Null
+  if (!(Test-Path -LiteralPath $Path)) { New-Item -Path $Path -ItemType Directory -Force | Out-Null }
+}
+
+# detect ISE presence safely
+$IsISE = $false
+try { $IsISE = (Get-Variable psISE -Scope Global -ErrorAction SilentlyContinue) -ne $null } catch {}
+
+# script-scope status
+$script:ScanStart = Get-Date
+$script:HeartbeatPath = $null
+
+function Start-RunStatus {
+  param([string]$OutputBase)
+  Ensure-Dir $OutputBase
+  $script:HeartbeatPath = Join-Path $OutputBase "progress.json"
+
+  # initialize heartbeat
+  $obj = [pscustomobject]@{
+    Timestamp     = (Get-Date).ToString("s")
+    Phase         = "Starting"
+    Root          = ""
+    Item          = ""
+    Index         = 0
+    Total         = 0
+    Percent       = 0
+    ElapsedSec    = 0
+    ETA           = ""
+    RemainingSec  = $null
   }
+  $obj | ConvertTo-Json -Depth 3 | Set-Content -Path $script:HeartbeatPath -Encoding UTF8
+
+  if ($IsISE) {
+    $global:psISE.PowerShellTabs[0].DisplayName = "Scan: 0% (Starting)"
+  } else {
+    try { $host.UI.RawUI.WindowTitle = "Scan: 0% (Starting)" } catch {}
+  }
+  Write-Progress -Id 1 -Activity "Disk usage scan" -Status "Starting" -PercentComplete 0
+}
+
+function Update-RunStatus {
+  param(
+    [string]$Phase,
+    [string]$Root,
+    [string]$Item,
+    [int]$Index,
+    [int]$Total
+  )
+  $pct = if ($Total -gt 0) { [math]::Min(100, [math]::Round(($Index / $Total) * 100, 0)) } else { 0 }
+  $elapsed = (New-TimeSpan -Start $script:ScanStart -End (Get-Date)).TotalSeconds
+  $eta = ""
+  $remaining = $null
+  if ($pct -gt 0) {
+    $totalEst  = $elapsed / ($pct/100.0)
+    $remaining = [int]([math]::Max(0, $totalEst - $elapsed))
+    $etaTime   = (Get-Date).AddSeconds($remaining)
+    $eta       = $etaTime.ToString("yyyy-MM-dd HH:mm:ss")
+  }
+
+  # write heartbeat JSON (others can open this file to watch progress)
+  $obj = [pscustomobject]@{
+    Timestamp     = (Get-Date).ToString("s")
+    Phase         = $Phase
+    Root          = $Root
+    Item          = $Item
+    Index         = $Index
+    Total         = $Total
+    Percent       = $pct
+    ElapsedSec    = [int]$elapsed
+    ETA           = $eta
+    RemainingSec  = $remaining
+  }
+  $obj | ConvertTo-Json -Depth 3 | Set-Content -Path $script:HeartbeatPath -Encoding UTF8
+
+  $title = "Scan: $pct% ($Phase)"
+  if ($IsISE) {
+    $global:psISE.PowerShellTabs[0].DisplayName = $title
+  } else {
+    try { $host.UI.RawUI.WindowTitle = $title } catch {}
+  }
+  Write-Progress -Id 1 -Activity "Disk usage scan" -Status "$Phase" -PercentComplete $pct
+}
+
+function Complete-RunStatus {
+  if ($IsISE) { $global:psISE.PowerShellTabs[0].DisplayName = "Scan: Complete" } else { try { $host.UI.RawUI.WindowTitle = "Scan: Complete" } catch {} }
+  Write-Progress -Id 1 -Activity "Disk usage scan" -Completed
+  # leave the heartbeat for post-run inspection; uncomment below to auto-remove:
+  # if (Test-Path $script:HeartbeatPath) { Remove-Item $script:HeartbeatPath -Force }
 }
 
 function Log([string]$msg) {
   ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg) | Out-File -FilePath $script:LogFile -Append -Encoding UTF8
 }
 
-# --- Prep output paths & logging ---
+# ---------------- OUTPUT PREP ----------------
 Ensure-Dir $OutputDir
 $logDir  = Join-Path $OutputDir "logs"
 Ensure-Dir $logDir
@@ -44,26 +124,26 @@ $monthTag    = Get-Date -Format 'yyyy-MM'
 $dayTag      = Get-Date -Format 'yyyyMMdd'
 $tagPart     = if ([string]::IsNullOrWhiteSpace($Tag)) { '' } else { "_$Tag" }
 
-$monthFolder       = Join-Path $OutputDir $monthTag
+$monthFolder = Join-Path $OutputDir $monthTag
 Ensure-Dir $monthFolder
 
-$detailCsv         = Join-Path $monthFolder ("FolderSizes{0}_{1}.csv" -f $tagPart, $dayTag)
-$byDepthCsv        = Join-Path $monthFolder ("FolderSizes_ByDepth{0}_{1}.csv" -f $tagPart, $dayTag)
-$masterCsv         = Join-Path $OutputDir  ("FolderSizes{0}_MASTER.csv" -f $tagPart)
+$detailCsv   = Join-Path $monthFolder ("FolderSizes{0}_{1}.csv" -f $tagPart, $dayTag)
+$byDepthCsv  = Join-Path $monthFolder ("FolderSizes_ByDepth{0}_{1}.csv" -f $tagPart, $dayTag)
+$masterCsv   = Join-Path $OutputDir  ("FolderSizes{0}_MASTER.csv" -f $tagPart)
 
+Start-RunStatus -OutputBase $OutputDir
 Log "Starting roll-up aggregation."
 Log "Roots: $($Folders -join '; ')"
 Log "Detail snapshot: $detailCsv"
 Log "By-Depth snapshot: $byDepthCsv"
 Log "Master: $masterCsv"
 
-# ---- Helpers for roll-up ----
+# ---- Helper funcs for roll-up ----
 function Get-Depth([string]$rootPath, [string]$fullPath) {
   $rel = $fullPath.Substring($rootPath.Length).TrimStart('\')
   if ([string]::IsNullOrEmpty($rel)) { return 0 }
   return $rel.Split('\').Count
 }
-
 function Max-Date($a, $b) {
   if ($null -eq $a) { return $b }
   if ($null -eq $b) { return $a }
@@ -72,19 +152,20 @@ function Max-Date($a, $b) {
 
 # Collector for all rows across all roots
 $rows = New-Object System.Collections.Generic.List[object]
+$rootIdx = 0
+$rootTotal = $Folders.Count
 
 foreach ($root in $Folders) {
-
+  $rootIdx++
   if (!(Test-Path -LiteralPath $root)) {
     Log "WARN: Root not found: $root"
     continue
   }
 
-  # Resolve and normalize root
   try { $rootPath = (Resolve-Path -LiteralPath $root).Path } catch { Log "WARN: Resolve-Path failed for $root : $($_.Exception.Message)"; continue }
-  Log "Enumerating under: $rootPath"
 
-  # 1) One-pass file enumeration for the entire tree
+  # Phase: Enumerating files
+  Update-RunStatus -Phase "Enumerating files ($rootIdx/$rootTotal)" -Root $rootPath -Item "" -Index 0 -Total 100
   $allFiles = @()
   try {
     $allFiles = Get-ChildItem -LiteralPath $rootPath -File -Recurse -Force -ErrorAction SilentlyContinue
@@ -92,11 +173,16 @@ foreach ($root in $Folders) {
     Log "ERROR: File enumeration failed for $rootPath : $($_.Exception.Message)"
     continue
   }
+  # bump the bar after enumeration
+  Update-RunStatus -Phase "Enumerating files ($rootIdx/$rootTotal)" -Root $rootPath -Item "" -Index 25 -Total 100
 
   # Group by directory for DIRECT metrics
   $fileGroups = $allFiles | Group-Object -Property DirectoryName
+  $grpTotal = [math]::Max(1, $fileGroups.Count)
+  $gIdx = 0
 
-  # 2) Build the complete folder list (include root + all subfolders)
+  # Build the complete folder list (include root + all subfolders)
+  Update-RunStatus -Phase "Enumerating folders ($rootIdx/$rootTotal)" -Root $rootPath -Item "" -Index 30 -Total 100
   $allDirs = @()
   try {
     $rootItem = Get-Item -LiteralPath $rootPath -ErrorAction Stop
@@ -107,48 +193,49 @@ foreach ($root in $Folders) {
     continue
   }
 
-  # 3) Precompute parent path & depth for each folder; also map children
-  $dirInfo = @{}  # key: FullName, value: @{ Parent=..., Depth=... }
-  $childrenByParent = @{} # key: ParentPath, value: list of child FullNames
+  # Precompute parent path & depth for each folder; also map children
+  $dirInfo = @{}
   foreach ($d in $allDirs) {
     $parent = Split-Path -Parent $d.FullName
     $depth  = Get-Depth -rootPath $rootPath -fullPath $d.FullName
     $dirInfo[$d.FullName] = @{ Parent = $parent; Depth = $depth }
-    if (-not $childrenByParent.ContainsKey($parent)) { $childrenByParent[$parent] = New-Object System.Collections.Generic.List[string] }
-    $childrenByParent[$parent].Add($d.FullName) | Out-Null
   }
 
-  # 4) DIRECT metrics per folder
-  $directSize = @{}    # bytes in that folder only (no subfolders)
-  $directCount = @{}   # files in that folder only
-  $directLast = @{}    # latest write among files directly in folder
+  # DIRECT metrics per folder
+  Update-RunStatus -Phase "Computing direct metrics ($rootIdx/$rootTotal)" -Root $rootPath -Item "" -Index 40 -Total 100
+  $directSize = @{}
+  $directCount = @{}
+  $directLast = @{}
 
   foreach ($g in $fileGroups) {
+    $gIdx++
+    if (($gIdx % 50) -eq 0 -or $gIdx -eq $grpTotal) {
+      Update-RunStatus -Phase "Computing direct metrics ($rootIdx/$rootTotal)" -Root $rootPath -Item $g.Name -Index (40 + [int](30 * ($gIdx/$grpTotal))) -Total 100
+    }
+
     $dirPath = $g.Name
     $filesInDir = $g.Group
     $sumBytes = ($filesInDir | Measure-Object -Property Length -Sum).Sum
     if (-not $sumBytes) { $sumBytes = 0 }
     $directSize[$dirPath] = [int64]$sumBytes
     $directCount[$dirPath] = $filesInDir.Count
-
     $last = $null
     if ($filesInDir.Count -gt 0) { $last = ($filesInDir | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime }
     $directLast[$dirPath] = $last
   }
 
-  # Ensure every directory has an entry (even if no files directly)
   foreach ($d in $allDirs) {
     if (-not $directSize.ContainsKey($d.FullName)) { $directSize[$d.FullName] = 0 }
     if (-not $directCount.ContainsKey($d.FullName)) { $directCount[$d.FullName] = 0 }
     if (-not $directLast.ContainsKey($d.FullName)) { $directLast[$d.FullName] = $d.LastWriteTime }
   }
 
-  # 5) ROLL-UP totals: start with direct, then add children totals bottom-up
+  # ROLL-UP totals (bottom-up)
+  Update-RunStatus -Phase "Rolling up totals ($rootIdx/$rootTotal)" -Root $rootPath -Item "" -Index 70 -Total 100
   $totalSize  = @{}
   $totalCount = @{}
   $totalLast  = @{}
 
-  # init totals with direct values
   foreach ($d in $allDirs) {
     $path = $d.FullName
     $totalSize[$path]  = [int64]$directSize[$path]
@@ -156,27 +243,29 @@ foreach ($root in $Folders) {
     $totalLast[$path]  = $directLast[$path]
   }
 
-  # sort folders by Depth DESC so children add into parents first
   $dirsDescByDepth = $allDirs | Sort-Object { $dirInfo[$_.FullName].Depth } -Descending
+  $dTotal = [math]::Max(1, $dirsDescByDepth.Count)
+  $dIdx = 0
   foreach ($d in $dirsDescByDepth) {
+    $dIdx++
+    if (($dIdx % 100) -eq 0 -or $dIdx -eq $dTotal) {
+      Update-RunStatus -Phase "Rolling up totals ($rootIdx/$rootTotal)" -Root $rootPath -Item $d.FullName -Index (70 + [int](20 * ($dIdx/$dTotal))) -Total 100
+    }
     $path   = $d.FullName
     $parent = $dirInfo[$path].Parent
     if ($null -ne $parent -and $parent.StartsWith($rootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-      # add child totals into parent
       $totalSize[$parent]  = ($totalSize[$parent]  + $totalSize[$path])
       $totalCount[$parent] = ($totalCount[$parent] + $totalCount[$path])
       $totalLast[$parent]  = Max-Date $totalLast[$parent] $totalLast[$path]
     }
   }
 
-  # 6) Emit rows (optionally skip truly empty folders)
+  # Emit rows
+  Update-RunStatus -Phase "Emitting rows ($rootIdx/$rootTotal)" -Root $rootPath -Item "" -Index 90 -Total 100
   foreach ($d in $allDirs) {
     $path  = $d.FullName
     $depth = $dirInfo[$path].Depth
-
-    if (-not $IncludeEmptyFolders -and $totalSize[$path] -eq 0 -and $totalCount[$path] -eq 0) {
-      continue
-    }
+    if (-not $IncludeEmptyFolders -and $totalSize[$path] -eq 0 -and $totalCount[$path] -eq 0) { continue }
 
     $rows.Add([pscustomobject]@{
       SnapshotDate      = Get-Date
@@ -184,25 +273,23 @@ foreach ($root in $Folders) {
       FolderPath        = $path
       FolderName        = Split-Path $path -Leaf
       Depth             = $depth
-
-      # DIRECT metrics (files in this folder only)
       DirectSizeBytes   = $directSize[$path]
       DirectSizeMB      = [math]::Round($directSize[$path]/1MB, 2)
       DirectSizeGB      = [math]::Round($directSize[$path]/1GB, 2)
       DirectFileCount   = $directCount[$path]
-
-      # ROLLED-UP totals (this folder + all descendants)
       TotalSizeBytes    = $totalSize[$path]
       TotalSizeMB       = [math]::Round($totalSize[$path]/1MB, 2)
       TotalSizeGB       = [math]::Round($totalSize[$path]/1GB, 2)
       TotalFileCount    = $totalCount[$path]
-
-      LastWriteTime     = $totalLast[$path]  # latest among this folder & children
+      LastWriteTime     = $totalLast[$path]
     }) | Out-Null
   }
+
+  # finish this root
+  Update-RunStatus -Phase "Finished root ($rootIdx/$rootTotal)" -Root $rootPath -Item "" -Index 100 -Total 100
 }
 
-# --- Exports ---
+# Export detail
 $rows = $rows | Sort-Object -Property TotalSizeBytes -Descending
 $rows | Export-Csv -Path $detailCsv -NoTypeInformation -Encoding UTF8
 
@@ -213,7 +300,7 @@ if (!(Test-Path -LiteralPath $masterCsv)) {
   $rows | Export-Csv -Path $masterCsv -NoTypeInformation -Append -Encoding UTF8
 }
 
-# Per-depth summary (sum totals per depth per root)
+# Per-depth summary
 $byDepth = $rows |
   Group-Object Root, Depth |
   ForEach-Object {
@@ -222,9 +309,9 @@ $byDepth = $rows |
     $sumBytes = ($_.Group | Measure-Object -Property TotalSizeBytes -Sum).Sum
     $sumFiles = ($_.Group | Measure-Object -Property TotalFileCount -Sum).Sum
     [pscustomobject]@{
-      SnapshotDate = Get-Date
-      Root         = $keyRoot
-      Depth        = $keyDepth
+      SnapshotDate   = Get-Date
+      Root           = $keyRoot
+      Depth          = $keyDepth
       TotalSizeBytes = [int64]$sumBytes
       TotalSizeMB    = [math]::Round($sumBytes/1MB, 2)
       TotalSizeGB    = [math]::Round($sumBytes/1GB, 2)
@@ -235,8 +322,11 @@ $byDepth = $rows |
 
 $byDepth | Export-Csv -Path $byDepthCsv -NoTypeInformation -Encoding UTF8
 
+Complete-RunStatus
+
 Write-Host "Done."
 Write-Host "Detail snapshot: $detailCsv"
 Write-Host "By-Depth snapshot: $byDepthCsv"
 Write-Host "Master updated: $masterCsv"
+Write-Host "Heartbeat: $script:HeartbeatPath"
 Write-Host "Log: $LogFile"
