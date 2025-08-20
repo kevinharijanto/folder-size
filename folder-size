@@ -1,140 +1,242 @@
 <# 
-.SYNOPSIS
-  Track selected folder sizes monthly and export to CSV for Excel.
+MonthlyFolderSizeTracker_Rollup.ps1
+Runs with no arguments. Press F5 in PowerShell ISE.
 
-.PARAMETER Folders
-  Array of folder paths to analyze (only these folders are scanned).
-
-.PARAMETER OutputDir
-  Root directory where results are stored. Script creates YYYY-MM subfolder automatically.
-
-.PARAMETER Tag
-  Optional label added to filenames, e.g., "workstations" or "projects".
-
-.EXAMPLE
-  .\MonthlyFolderSizeTracker.ps1 `
-    -Folders 'D:\Projects','E:\Video','C:\Data\Archive' `
-    -OutputDir "$env:USERPROFILE\Documents\FolderStats" `
-    -Tag 'key_folders'
+- Scans all depths
+- Adds Depth (0=root, 1=child, ...)
+- Computes both direct and rolled-up (recursive) sizes & file counts
+- Exports:
+   1) detailed per-folder snapshot (with totals)
+   2) per-depth summary snapshot (sum by depth)
+   3) updates MASTER (detailed)
 #>
 
-[CmdletBinding()]
-param(
-  [Parameter(Mandatory=$true)]
-  [string[]]$Folders,
-
-  [Parameter(Mandatory=$true)]
-  [string]$OutputDir,
-
-  [string]$Tag
+# ===================== EDIT ME =====================
+[string[]]$Folders = @(
+  'C:\Users\Kevin\Documents'   # add more roots if you like
 )
 
-function Get-FolderStats {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$FolderPath
-    )
+[string]$OutputDir = 'C:\Users\Kevin\Documents\Space Check'
 
-    # Resolve and verify
-    $item = Get-Item -LiteralPath $FolderPath -ErrorAction SilentlyContinue
-    if (-not $item -or -not $item.PSIsContainer) {
-        throw "Folder not found or not a directory: $FolderPath"
-    }
+[string]$Tag = 'monthly'
 
-    # Enumerate all files under folder
-    $files = @()
-    try {
-        $files = Get-ChildItem -LiteralPath $FolderPath -File -Recurse -Force -ErrorAction SilentlyContinue
-    } catch { }
+# Include folders that have no files at all?
+[bool]$IncludeEmptyFolders = $true
+# =================== /EDIT ME ======================
 
-    $sizeBytes = ($files | Measure-Object -Property Length -Sum).Sum
-    if (-not $sizeBytes) { $sizeBytes = 0 }
-
-    $fileCount = $files.Count
-
-    # Count subfolders
-    $subfolders = @()
-    try {
-        $subfolders = Get-ChildItem -LiteralPath $FolderPath -Directory -Recurse -Force -ErrorAction SilentlyContinue
-    } catch { }
-    $subfolderCount = $subfolders.Count
-
-    # Last write time (latest)
-    $lastWrite = $null
-    if ($files.Count -gt 0) {
-        $lastWrite = ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
-    } else {
-        try {
-            $lastWrite = (Get-Item -LiteralPath $FolderPath -Force -ErrorAction SilentlyContinue).LastWriteTime
-        } catch { $lastWrite = $null }
-    }
-
-    [pscustomobject]@{
-        SnapshotDate   = Get-Date
-        FolderPath     = $FolderPath
-        FolderName     = Split-Path $FolderPath -Leaf
-        SizeBytes      = [int64]$sizeBytes
-        SizeMB         = if ($sizeBytes -gt 0) { [math]::Round($sizeBytes/1MB, 2) } else { 0 }
-        SizeGB         = if ($sizeBytes -gt 0) { [math]::Round($sizeBytes/1GB, 2) } else { 0 }
-        FileCount      = $fileCount
-        SubfolderCount = $subfolderCount
-        LastWriteTime  = $lastWrite
-    }
+function Ensure-Dir([string]$Path) {
+  if (!(Test-Path -LiteralPath $Path)) {
+    New-Item -Path $Path -ItemType Directory -Force | Out-Null
+  }
 }
 
-# --- Prep output paths (monthly folder + filenames) ---
-$monthTag = Get-Date -Format 'yyyy-MM'
-$dayTag   = Get-Date -Format 'yyyyMMdd'
-$tagPart  = if ([string]::IsNullOrWhiteSpace($Tag)) { '' } else { "_$Tag" }
-
-$monthFolder = Join-Path $OutputDir $monthTag
-if (-not (Test-Path -LiteralPath $monthFolder)) {
-    New-Item -Path $monthFolder -ItemType Directory -Force | Out-Null
+function Log([string]$msg) {
+  ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg) | Out-File -FilePath $script:LogFile -Append -Encoding UTF8
 }
 
-# Dated snapshot (for this run) and rolling master log
-$dailyCsv   = Join-Path $monthFolder ("FolderSizes{0}_{1}.csv" -f $tagPart, $dayTag)
-$masterCsv  = Join-Path $OutputDir  ("FolderSizes{0}_MASTER.csv" -f $tagPart)
+# --- Prep output paths & logging ---
+Ensure-Dir $OutputDir
+$logDir  = Join-Path $OutputDir "logs"
+Ensure-Dir $logDir
+$script:LogFile = Join-Path $logDir ("scan_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
-Write-Host "Analyzing selected folders..."
-Write-Host "Month folder : $monthFolder"
-Write-Host "Daily CSV    : $dailyCsv"
-Write-Host "Master CSV   : $masterCsv"
-Write-Host ""
+$monthTag    = Get-Date -Format 'yyyy-MM'
+$dayTag      = Get-Date -Format 'yyyyMMdd'
+$tagPart     = if ([string]::IsNullOrWhiteSpace($Tag)) { '' } else { "_$Tag" }
 
-# --- Scan selected folders ---
-$results = New-Object System.Collections.Generic.List[object]
-$total = $Folders.Count
-$idx = 0
+$monthFolder       = Join-Path $OutputDir $monthTag
+Ensure-Dir $monthFolder
 
-foreach ($folder in $Folders) {
-    $idx++
-    $pct = [int](($idx / $total) * 100)
-    Write-Progress -Activity "Scanning selected folders" -Status "$idx of $total" -PercentComplete $pct -CurrentOperation $folder
+$detailCsv         = Join-Path $monthFolder ("FolderSizes{0}_{1}.csv" -f $tagPart, $dayTag)
+$byDepthCsv        = Join-Path $monthFolder ("FolderSizes_ByDepth{0}_{1}.csv" -f $tagPart, $dayTag)
+$masterCsv         = Join-Path $OutputDir  ("FolderSizes{0}_MASTER.csv" -f $tagPart)
 
-    try {
-        $stats = Get-FolderStats -FolderPath $folder
-        $results.Add($stats) | Out-Null
-    } catch {
-        Write-Warning "Skipped $folder: $_"
+Log "Starting roll-up aggregation."
+Log "Roots: $($Folders -join '; ')"
+Log "Detail snapshot: $detailCsv"
+Log "By-Depth snapshot: $byDepthCsv"
+Log "Master: $masterCsv"
+
+# ---- Helpers for roll-up ----
+function Get-Depth([string]$rootPath, [string]$fullPath) {
+  $rel = $fullPath.Substring($rootPath.Length).TrimStart('\')
+  if ([string]::IsNullOrEmpty($rel)) { return 0 }
+  return $rel.Split('\').Count
+}
+
+function Max-Date($a, $b) {
+  if ($null -eq $a) { return $b }
+  if ($null -eq $b) { return $a }
+  if ($a -ge $b) { return $a } else { return $b }
+}
+
+# Collector for all rows across all roots
+$rows = New-Object System.Collections.Generic.List[object]
+
+foreach ($root in $Folders) {
+
+  if (!(Test-Path -LiteralPath $root)) {
+    Log "WARN: Root not found: $root"
+    continue
+  }
+
+  # Resolve and normalize root
+  try { $rootPath = (Resolve-Path -LiteralPath $root).Path } catch { Log "WARN: Resolve-Path failed for $root : $($_.Exception.Message)"; continue }
+  Log "Enumerating under: $rootPath"
+
+  # 1) One-pass file enumeration for the entire tree
+  $allFiles = @()
+  try {
+    $allFiles = Get-ChildItem -LiteralPath $rootPath -File -Recurse -Force -ErrorAction SilentlyContinue
+  } catch {
+    Log "ERROR: File enumeration failed for $rootPath : $($_.Exception.Message)"
+    continue
+  }
+
+  # Group by directory for DIRECT metrics
+  $fileGroups = $allFiles | Group-Object -Property DirectoryName
+
+  # 2) Build the complete folder list (include root + all subfolders)
+  $allDirs = @()
+  try {
+    $rootItem = Get-Item -LiteralPath $rootPath -ErrorAction Stop
+    $allDirs = @($rootItem)
+    $allDirs += Get-ChildItem -LiteralPath $rootPath -Directory -Recurse -Force -ErrorAction SilentlyContinue
+  } catch {
+    Log "ERROR: Folder enumeration failed for $rootPath : $($_.Exception.Message)"
+    continue
+  }
+
+  # 3) Precompute parent path & depth for each folder; also map children
+  $dirInfo = @{}  # key: FullName, value: @{ Parent=..., Depth=... }
+  $childrenByParent = @{} # key: ParentPath, value: list of child FullNames
+  foreach ($d in $allDirs) {
+    $parent = Split-Path -Parent $d.FullName
+    $depth  = Get-Depth -rootPath $rootPath -fullPath $d.FullName
+    $dirInfo[$d.FullName] = @{ Parent = $parent; Depth = $depth }
+    if (-not $childrenByParent.ContainsKey($parent)) { $childrenByParent[$parent] = New-Object System.Collections.Generic.List[string] }
+    $childrenByParent[$parent].Add($d.FullName) | Out-Null
+  }
+
+  # 4) DIRECT metrics per folder
+  $directSize = @{}    # bytes in that folder only (no subfolders)
+  $directCount = @{}   # files in that folder only
+  $directLast = @{}    # latest write among files directly in folder
+
+  foreach ($g in $fileGroups) {
+    $dirPath = $g.Name
+    $filesInDir = $g.Group
+    $sumBytes = ($filesInDir | Measure-Object -Property Length -Sum).Sum
+    if (-not $sumBytes) { $sumBytes = 0 }
+    $directSize[$dirPath] = [int64]$sumBytes
+    $directCount[$dirPath] = $filesInDir.Count
+
+    $last = $null
+    if ($filesInDir.Count -gt 0) { $last = ($filesInDir | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime }
+    $directLast[$dirPath] = $last
+  }
+
+  # Ensure every directory has an entry (even if no files directly)
+  foreach ($d in $allDirs) {
+    if (-not $directSize.ContainsKey($d.FullName)) { $directSize[$d.FullName] = 0 }
+    if (-not $directCount.ContainsKey($d.FullName)) { $directCount[$d.FullName] = 0 }
+    if (-not $directLast.ContainsKey($d.FullName)) { $directLast[$d.FullName] = $d.LastWriteTime }
+  }
+
+  # 5) ROLL-UP totals: start with direct, then add children totals bottom-up
+  $totalSize  = @{}
+  $totalCount = @{}
+  $totalLast  = @{}
+
+  # init totals with direct values
+  foreach ($d in $allDirs) {
+    $path = $d.FullName
+    $totalSize[$path]  = [int64]$directSize[$path]
+    $totalCount[$path] = [int64]$directCount[$path]
+    $totalLast[$path]  = $directLast[$path]
+  }
+
+  # sort folders by Depth DESC so children add into parents first
+  $dirsDescByDepth = $allDirs | Sort-Object { $dirInfo[$_.FullName].Depth } -Descending
+  foreach ($d in $dirsDescByDepth) {
+    $path   = $d.FullName
+    $parent = $dirInfo[$path].Parent
+    if ($null -ne $parent -and $parent.StartsWith($rootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+      # add child totals into parent
+      $totalSize[$parent]  = ($totalSize[$parent]  + $totalSize[$path])
+      $totalCount[$parent] = ($totalCount[$parent] + $totalCount[$path])
+      $totalLast[$parent]  = Max-Date $totalLast[$parent] $totalLast[$path]
     }
+  }
+
+  # 6) Emit rows (optionally skip truly empty folders)
+  foreach ($d in $allDirs) {
+    $path  = $d.FullName
+    $depth = $dirInfo[$path].Depth
+
+    if (-not $IncludeEmptyFolders -and $totalSize[$path] -eq 0 -and $totalCount[$path] -eq 0) {
+      continue
+    }
+
+    $rows.Add([pscustomobject]@{
+      SnapshotDate      = Get-Date
+      Root              = $rootPath
+      FolderPath        = $path
+      FolderName        = Split-Path $path -Leaf
+      Depth             = $depth
+
+      # DIRECT metrics (files in this folder only)
+      DirectSizeBytes   = $directSize[$path]
+      DirectSizeMB      = [math]::Round($directSize[$path]/1MB, 2)
+      DirectSizeGB      = [math]::Round($directSize[$path]/1GB, 2)
+      DirectFileCount   = $directCount[$path]
+
+      # ROLLED-UP totals (this folder + all descendants)
+      TotalSizeBytes    = $totalSize[$path]
+      TotalSizeMB       = [math]::Round($totalSize[$path]/1MB, 2)
+      TotalSizeGB       = [math]::Round($totalSize[$path]/1GB, 2)
+      TotalFileCount    = $totalCount[$path]
+
+      LastWriteTime     = $totalLast[$path]  # latest among this folder & children
+    }) | Out-Null
+  }
 }
 
-# Sort by largest first (nice for Excel)
-$results = $results | Sort-Object SizeBytes -Descending
+# --- Exports ---
+$rows = $rows | Sort-Object -Property TotalSizeBytes -Descending
+$rows | Export-Csv -Path $detailCsv -NoTypeInformation -Encoding UTF8
 
-# --- Write daily CSV (snapshot) ---
-$results | Export-Csv -Path $dailyCsv -NoTypeInformation -Encoding UTF8
-
-# --- Append/update master CSV ---
-# If master doesn't exist, create it; otherwise append
-if (-not (Test-Path -LiteralPath $masterCsv)) {
-    $results | Export-Csv -Path $masterCsv -NoTypeInformation -Encoding UTF8
+# MASTER (append detailed rows)
+if (!(Test-Path -LiteralPath $masterCsv)) {
+  $rows | Export-Csv -Path $masterCsv -NoTypeInformation -Encoding UTF8
 } else {
-    $results | Export-Csv -Path $masterCsv -NoTypeInformation -Append -Encoding UTF8
+  $rows | Export-Csv -Path $masterCsv -NoTypeInformation -Append -Encoding UTF8
 }
 
-Write-Host ""
+# Per-depth summary (sum totals per depth per root)
+$byDepth = $rows |
+  Group-Object Root, Depth |
+  ForEach-Object {
+    $keyRoot  = $_.Group[0].Root
+    $keyDepth = $_.Group[0].Depth
+    $sumBytes = ($_.Group | Measure-Object -Property TotalSizeBytes -Sum).Sum
+    $sumFiles = ($_.Group | Measure-Object -Property TotalFileCount -Sum).Sum
+    [pscustomobject]@{
+      SnapshotDate = Get-Date
+      Root         = $keyRoot
+      Depth        = $keyDepth
+      TotalSizeBytes = [int64]$sumBytes
+      TotalSizeMB    = [math]::Round($sumBytes/1MB, 2)
+      TotalSizeGB    = [math]::Round($sumBytes/1GB, 2)
+      TotalFiles     = [int64]$sumFiles
+      FolderCount    = $_.Group.Count
+    }
+  } | Sort-Object Root, Depth
+
+$byDepth | Export-Csv -Path $byDepthCsv -NoTypeInformation -Encoding UTF8
+
 Write-Host "Done."
-Write-Host "Snapshot saved to: $dailyCsv"
-Write-Host "Master log updated: $masterCsv"
+Write-Host "Detail snapshot: $detailCsv"
+Write-Host "By-Depth snapshot: $byDepthCsv"
+Write-Host "Master updated: $masterCsv"
+Write-Host "Log: $LogFile"
