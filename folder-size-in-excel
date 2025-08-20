@@ -1,0 +1,68 @@
+1. Run the .ps1 file from Excel VBA
+
+Put this in a VBA module:
+
+Sub RunPowerShellScript()
+    Dim PowerShell As String
+    Dim ScriptPath As String
+    
+    ' Full path to your PowerShell script
+    ScriptPath = "C:\Path\To\UL_Folder_Size.ps1"
+    
+    ' Run with PowerShell
+    PowerShell = "powershell.exe -ExecutionPolicy Bypass -File """ & ScriptPath & """"
+    
+    Shell PowerShell, vbNormalFocus
+End Sub
+
+
+👉 This launches PowerShell, runs your script, and exits.
+If you want Excel to wait until the script finishes before continuing, you can wrap the Shell with WScript.Shell.Run.
+
+2. Pass parameters from Excel to PowerShell
+
+If you want Excel to control which folder/output the script uses:
+
+Sub RunPowerShellWithParams()
+    Dim PowerShell As String
+    Dim ScriptPath As String
+    Dim OutFile As String
+    Dim DirPath As String
+    
+    ScriptPath = "C:\Path\To\UL_Folder_Size.ps1"
+    OutFile = "C:\Temp\Report.csv"
+    DirPath = "\\server\share\folder"
+    
+    PowerShell = "powershell.exe -ExecutionPolicy Bypass -File """ & ScriptPath & """ -outfile """ & OutFile & """ -dir """ & DirPath & """"
+    
+    Shell PowerShell, vbNormalFocus
+End Sub
+
+3. Read the CSV back into Excel automatically
+
+Since your script outputs to CSV, you can load it back:
+
+Sub ImportFolderSizeReport()
+    Dim ws As Worksheet
+    Dim csvPath As String
+    
+    csvPath = "C:\Temp\Report.csv"
+    
+    Set ws = ThisWorkbook.Sheets("Sheet1")
+    ws.Cells.Clear
+    
+    With ws.QueryTables.Add(Connection:="TEXT;" & csvPath, Destination:=ws.Range("A1"))
+        .TextFileParseType = xlDelimited
+        .TextFileCommaDelimiter = True
+        .Refresh BackgroundQuery:=False
+    End With
+End Sub
+
+
+✅ So yes — you can chain it like this in Excel VBA:
+
+Run the PowerShell script (with parameters).
+
+Wait until it finishes.
+
+Import the generated CSV back into Excel automatically.
